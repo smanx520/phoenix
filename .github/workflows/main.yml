@@ -1,0 +1,648 @@
+name: Phoenix Runner
+
+env:
+  # Default backup list lives in a file to keep this workflow readable.
+  BACKUP_DIRS_FILE: '.github/backup-dirs.txt'
+  BACKUP_PASSWORD: ${{ secrets.BACKUP_PASSWORD || 'admin' }}
+  DURATION: ${{ secrets.DURATION || '330' }}
+  WAIT_BEFORE_NEXT: ${{ secrets.WAIT_BEFORE_NEXT || '60' }}
+  HF_USERNAME: ${{ secrets.HF_USERNAME || 'nudomaga' }}
+  HF_TOKEN: ${{ secrets.HF_TOKEN || '' }}
+  HF_DATASET: ${{ secrets.HF_DATASET || 'nudomaga/phoenix-data' }}
+  CF_TUNNEL_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN || '' }}
+  HOSTNAME: ${{ secrets.HOSTNAME || 'github-runner' }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: '操作类型'
+        required: true
+        default: 'run'
+        type: choice
+        options:
+          - run
+          - stop
+          - restart
+      duration:
+        description: '保活时长（分钟）'
+        required: false
+        type: string
+      backup_dirs:
+        description: '备份目录（逗号分隔）'
+        required: false
+        type: string
+  repository_dispatch:
+    types: [run-next]
+
+jobs:
+  # 发送停止信号
+  stop:
+    if: github.event_name == 'workflow_dispatch' && (inputs.action == 'stop' || inputs.action == 'restart')
+    runs-on: ubuntu-latest
+    steps:
+      - name: 发送停止信号
+        run: |
+          TOKEN="${{ env.HF_TOKEN }}"
+          USERNAME="${{ env.HF_USERNAME }}"
+          DATASET="${{ env.HF_DATASET }}"
+          ACTION="${{ inputs.action }}"
+
+          if [ -z "$TOKEN" ]; then
+            echo "错误：HF_TOKEN 未设置"
+            exit 1
+          fi
+
+          # 安装依赖
+          pip install huggingface_hub -q
+          sudo apt-get install -y git-lfs
+          git lfs install
+
+          # 配置 git
+          git config --global user.name "$USERNAME"
+          git config --global user.email "$USERNAME@users.noreply.huggingface.co"
+
+          # 设置环境变量供 Python 使用
+          export TOKEN="$TOKEN"
+          export DATASET="$DATASET"
+
+          # 检查并创建仓库
+          python << 'EOF'
+          from huggingface_hub import HfApi, create_repo, repo_exists
+          import os
+
+          token = os.environ.get('TOKEN')
+          dataset = os.environ.get('DATASET')
+
+          if not repo_exists(repo_id=dataset, repo_type="dataset", token=token):
+              print(f"创建 dataset 仓库: {dataset}")
+              create_repo(
+                  repo_id=dataset,
+                  repo_type="dataset",
+                  token=token,
+                  private=False,
+                  exist_ok=True
+              )
+              print(f"✅ 仓库创建成功")
+          else:
+              print(f"✅ 仓库已存在")
+          EOF
+
+          # 克隆仓库
+          if git clone "https://$USERNAME:$TOKEN@huggingface.co/datasets/$DATASET" repo 2>/dev/null; then
+            cd repo
+          else
+            mkdir -p repo
+            cd repo
+            git init
+            git remote add origin "https://$USERNAME:$TOKEN@huggingface.co/datasets/$DATASET"
+          fi
+
+          # 创建停止信号文件
+          RESTART=false
+          if [ "$ACTION" = "restart" ]; then
+            RESTART=true
+          fi
+          echo '{"stop": true, "restart": '"$RESTART"', "timestamp": "'$(date -Iseconds)'"}' > stop.json
+
+          # 提交并推送
+          git add stop.json
+          git commit -m "stop signal $(date '+%Y-%m-%d %H:%M:%S')" --allow-empty
+          git push -f origin HEAD:main 2>/dev/null || git push -u origin HEAD:main
+
+            echo "✅ 停止信号已发送"
+            echo "   正在运行的 loop 将在 30 秒内执行备份并退出"
+            echo "   restart: $RESTART"
+
+  # 正常运行
+  run:
+    if: github.event_name != 'workflow_dispatch' || (inputs.action != 'stop' && inputs.action != 'restart')
+    runs-on: ubuntu-latest
+    timeout-minutes: 360  # 6小时最大限制
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # =============================================
+      # 使用 Git LFS 从 Hugging Face 下载并恢复备份
+      # =============================================
+      - name: 恢复备份
+        run: |
+          TOKEN="${{ env.HF_TOKEN }}"
+          USERNAME="${{ env.HF_USERNAME }}"
+          DATASET="${{ env.HF_DATASET }}"
+          PASSWORD="${{ env.BACKUP_PASSWORD }}"
+
+          # 计算期望恢复的条目列表（用于恢复完成后的明细输出）
+          DIRS_INPUT="${{ inputs.backup_dirs }}"
+          if [ -n "$DIRS_INPUT" ]; then
+            EXPECTED_DIRS="$DIRS_INPUT"
+          elif [ -n "${{ env.BACKUP_DIRS_FILE }}" ] && [ -f "${{ env.BACKUP_DIRS_FILE }}" ]; then
+            EXPECTED_DIRS="$(paste -sd, "${{ env.BACKUP_DIRS_FILE }}")"
+          else
+            EXPECTED_DIRS=""
+          fi
+
+          # 安装 git-lfs
+          sudo apt-get install -y git-lfs
+          git lfs install
+
+          echo "============================================="
+          echo "📥 开始下载备份..."
+          echo "============================================="
+          DOWNLOAD_START=$(date +%s)
+
+          # 克隆仓库（包含 LFS 文件）
+          if git clone "https://$USERNAME:$TOKEN@huggingface.co/datasets/$DATASET" repo 2>/dev/null; then
+            DOWNLOAD_END=$(date +%s)
+            DOWNLOAD_TIME=$((DOWNLOAD_END - DOWNLOAD_START))
+            echo "✅ 克隆仓库成功 (耗时: ${DOWNLOAD_TIME} 秒)"
+            if [ -f "repo/backup.tar.gz.enc" ]; then
+              mv repo/backup.tar.gz.enc .
+              echo "✅ 备份文件下载成功"
+            else
+              echo "首次运行，无备份"
+            fi
+            rm -rf repo
+          else
+            DOWNLOAD_END=$(date +%s)
+            DOWNLOAD_TIME=$((DOWNLOAD_END - DOWNLOAD_START))
+            echo "首次运行，无备份 (耗时: ${DOWNLOAD_TIME} 秒)"
+          fi
+
+          if [ -f backup.tar.gz.enc ]; then
+            echo ""
+            echo "============================================="
+            echo "📦 开始解密解压备份..."
+            echo "============================================="
+            
+            # 显示文件信息
+            BACKUP_SIZE=$(ls -lh backup.tar.gz.enc | awk '{print $5}')
+            echo "备份文件大小: ${BACKUP_SIZE}"
+            echo ""
+            
+            RESTORE_START=$(date +%s)
+
+            # 先测试解密是否成功
+            echo "测试解密..."
+            if ! openssl enc -aes-256-cbc -d -salt -pbkdf2 -pass pass:"$PASSWORD" -in backup.tar.gz.enc -out /dev/null 2>&1; then
+              echo "❌ 解密失败：密码不匹配或文件损坏"
+              exit 1
+            fi
+            echo "✓ 解密测试通过"
+            echo ""
+            
+            # 创建临时目录
+            RESTORE_TMP=$(mktemp -d)
+            echo "解压到临时目录: ${RESTORE_TMP}"
+            
+            echo "正在解压..."
+            # 解密并解压到临时目录
+            openssl enc -aes-256-cbc -d -salt -pbkdf2 -pass pass:"$PASSWORD" -in backup.tar.gz.enc 2>/dev/null | sudo tar -zxpf - -C "$RESTORE_TMP" 2>&1
+            TAR_EXIT=${PIPESTATUS[1]}
+            
+            if [ $TAR_EXIT -ne 0 ]; then
+              echo "❌ 解压失败"
+              sudo rm -rf "$RESTORE_TMP"
+              exit 1
+            fi
+            
+            echo "✓ 解压完成"
+            echo ""
+
+            # 停止 Docker 服务
+            echo "停止 Docker 服务..."
+            sudo systemctl stop docker 2>/dev/null || true
+            sudo systemctl stop docker.socket 2>/dev/null || true
+
+            echo "正在同步文件到目标目录..."
+            # 按配置的完整路径逐条同步，便于日志可读、避免只看到 /root、/var。
+            # 只覆盖存在的文件，不使用 --delete。
+            SYNC_ERRORS=0
+            if [ -n "$EXPECTED_DIRS" ]; then
+              # 允许逗号/换行分隔
+              EXPECTED_LIST=$(printf '%s' "$EXPECTED_DIRS" | tr ',\n' '  ')
+
+              # 后台异步计算各目录大小（与 rsync 并行）
+              SIZE_FILE=$(mktemp)
+              (
+                for p in $EXPECTED_LIST; do
+                  [ -z "$p" ] && continue
+                  REL_PATH="${p#/}"
+                  SRC_PATH="$RESTORE_TMP/$REL_PATH"
+                  if sudo test -d "$SRC_PATH" 2>/dev/null; then
+                    SZ=$(sudo du -sm "$SRC_PATH" 2>/dev/null | cut -f1)
+                    echo "$p:$SZ" >> "$SIZE_FILE"
+                  elif sudo test -f "$SRC_PATH" 2>/dev/null; then
+                    SZ=$(sudo du -m "$SRC_PATH" 2>/dev/null | cut -f1)
+                    echo "$p:$SZ" >> "$SIZE_FILE"
+                  else
+                    echo "$p:N/A" >> "$SIZE_FILE"
+                  fi
+                done
+                echo "done" >> "$SIZE_FILE"
+              ) &
+              SIZE_PID=$!
+
+              # 同步文件
+              for p in $EXPECTED_LIST; do
+                [ -z "$p" ] && continue
+
+                REL_PATH="${p#/}"
+                SRC_PATH="$RESTORE_TMP/$REL_PATH"
+                DEST_PATH="$p"
+
+                if sudo test -d "$SRC_PATH" 2>/dev/null; then
+                  echo "  同步: $DEST_PATH"
+                  sudo mkdir -p "$DEST_PATH" 2>/dev/null || true
+                  sudo rsync -a "$SRC_PATH/" "$DEST_PATH/" 2>&1 || SYNC_ERRORS=$((SYNC_ERRORS + 1))
+                elif sudo test -f "$SRC_PATH" 2>/dev/null; then
+                  echo "  同步: $DEST_PATH"
+                  sudo mkdir -p "$(dirname "$DEST_PATH")" 2>/dev/null || true
+                  sudo rsync -a "$SRC_PATH" "$DEST_PATH" 2>&1 || SYNC_ERRORS=$((SYNC_ERRORS + 1))
+                else
+                  echo "  跳过: $DEST_PATH (备份中不存在)"
+                fi
+              done
+
+              # 等待大小计算完成
+              wait $SIZE_PID 2>/dev/null || true
+            else
+              echo "  (未配置备份清单，跳过逐条同步)"
+            fi
+
+            # 启动 Docker 服务
+            echo "启动 Docker 服务..."
+            sudo systemctl start docker 2>/dev/null || true
+
+            echo ""
+            echo "============================================="
+            echo "📋 恢复明细"
+            echo "============================================="
+
+            if [ -n "$EXPECTED_DIRS" ] && [ -f "$SIZE_FILE" ]; then
+              echo "路径                      | 大小"
+              echo "-------------------------|--------"
+
+              while IFS=: read -r p sz; do
+                if [ "$p" = "done" ]; then break; fi
+                printf "%-24s | %4s MB\n" "$p" "$sz"
+              done < "$SIZE_FILE"
+              rm -f "$SIZE_FILE"
+            else
+              echo "(未配置 backup_dirs 或 ${BACKUP_DIRS_FILE}，跳过明细输出)"
+            fi
+             
+            # 清理临时目录
+            sudo rm -rf "$RESTORE_TMP"
+            
+            RESTORE_END=$(date +%s)
+            RESTORE_TIME=$((RESTORE_END - RESTORE_START))
+            
+            if [ $SYNC_ERRORS -eq 0 ]; then
+              echo "✅ 备份恢复完成 (耗时: ${RESTORE_TIME} 秒)"
+            else
+              echo "⚠️ 备份恢复完成，但有 ${SYNC_ERRORS} 个错误 (耗时: ${RESTORE_TIME} 秒)"
+            fi
+            
+            echo ""
+            echo "============================================="
+            echo "📊 恢复统计"
+            echo "============================================="
+            echo "📥 下载耗时: ${DOWNLOAD_TIME} 秒"
+            echo "📦 解压耗时: ${RESTORE_TIME} 秒"
+            echo "⏱️  总耗时: $((DOWNLOAD_TIME + RESTORE_TIME)) 秒"
+          fi
+
+          # 确保所有后台进程完成
+          wait
+
+      # =============================================
+      # 运行你的项目
+      # =============================================
+      - name: 安装并启动应用
+        run: |
+          if [ -f "start-loop.sh" ]; then
+            echo "正在以 root 用户启动应用..."
+            # 以 root 用户执行，加载 root 环境变量
+            sudo -E bash -lc "source /root/.bashrc 2>/dev/null || true; cd '$GITHUB_WORKSPACE'; bash start-loop.sh"
+          else
+            echo "警告：未找到 start-loop.sh 文件，跳过应用启动"
+          fi
+
+      - name: 保持工作流运行
+        run: |
+          echo "============================================="
+          echo "🚀 启动保活进程"
+          echo "============================================="
+          echo ""
+
+          DURATION_MINUTES=${{ inputs.duration || env.DURATION }}
+          DURATION_SECONDS=$((DURATION_MINUTES * 60))
+
+          echo "⏱️  设置运行时长: ${DURATION_MINUTES} 分钟"
+          echo ""
+
+          START_TIME=$(date +%s)
+          ITERATION=0
+
+          while true; do
+            ITERATION=$((ITERATION + 1))
+            CURRENT_TIME=$(date +%s)
+            ELAPSED=$((CURRENT_TIME - START_TIME))
+
+           if [ $ELAPSED -ge $DURATION_SECONDS ]; then
+             echo "============================================="
+             echo "⏰ 已达到设置的运行时长"
+             echo "============================================="
+             echo "运行了 ${DURATION_MINUTES} 分钟，现在退出"
+             echo ""
+             # DURATION 到点后：继续执行备份/上传，并触发下一次运行。
+             echo "RESTART_REQUESTED=true" >> $GITHUB_ENV
+             break
+           fi
+
+            ELAPSED_HOURS=$((ELAPSED / 3600))
+            ELAPSED_MINS=$(((ELAPSED % 3600) / 60))
+            ELAPSED_SECS=$((ELAPSED % 60))
+
+            DURATION_HOURS=$((DURATION_SECONDS / 3600))
+            DURATION_MINS=$(((DURATION_SECONDS % 3600) / 60))
+            DURATION_SECS=$((DURATION_SECONDS % 60))
+
+            DISK_USED=$(df -h / | tail -1 | awk '{print $3}')
+            DISK_AVAIL=$(df -h / | tail -1 | awk '{print $4}')
+            DISK_PERCENT=$(df -h / | tail -1 | awk '{print $5}')
+            MEM_USED=$(free -h | grep Mem | awk '{print $3}')
+            MEM_AVAIL=$(free -h | grep Mem | awk '{print $7}')
+
+            echo "============================================="
+            echo "📊 状态报告 #${ITERATION}"
+            echo "============================================="
+            echo "⏰ 已运行: ${ELAPSED_HOURS}小时 ${ELAPSED_MINS}分 ${ELAPSED_SECS}秒"
+            echo "⏱️ 设置时长: ${DURATION_HOURS}小时 ${DURATION_MINS}分 ${DURATION_SECS}秒 (${DURATION_SECONDS}秒)"
+            echo "📅 当前时间: $(date '+%Y-%m-%d %H:%M:%S')"
+            echo ""
+            echo "💾 磁盘使用: 已用 ${DISK_USED} | 可用 ${DISK_AVAIL} | 使用率 ${DISK_PERCENT}"
+            echo "🧠 内存使用: 已用 ${MEM_USED} | 可用 ${MEM_AVAIL}"
+            echo ""
+            echo "🔄 下次更新将在 5 分钟后..."
+            echo "============================================="
+            echo ""
+
+            # 使用短间隔 sleep，每秒检查停止信号
+            for i in $(seq 1 300); do
+              # 每 30 秒检查一次停止信号
+              if [ $((i % 30)) -eq 0 ]; then
+                # Hugging Face raw may be cached; add a cache-busting query param.
+                STOP_URL="https://huggingface.co/datasets/${{ env.HF_DATASET }}/raw/main/stop.json?t=$(date +%s)"
+                STOP_FILE=$(curl -s -H 'Cache-Control: no-cache' --connect-timeout 3 "$STOP_URL" 2>/dev/null || echo "")
+                if [ -n "$STOP_FILE" ]; then
+                  STOP_VALUE=$(echo "$STOP_FILE" | grep -o '"stop"[[:space:]]*:[[:space:]]*[a-z]*' | head -1 | cut -d':' -f2 | tr -d ' ')
+                  if [ "$STOP_VALUE" = "true" ]; then
+                    RESTART_VALUE=$(echo "$STOP_FILE" | grep -o '"restart"[[:space:]]*:[[:space:]]*[a-z]*' | head -1 | cut -d':' -f2 | tr -d ' ')
+                    echo "stop.json: $STOP_FILE"
+                    echo "解析 stop=$STOP_VALUE restart=${RESTART_VALUE:-<missing>}"
+                    echo ""
+                    echo "============================================="
+                    echo "🛑 收到停止信号"
+                    echo "============================================="
+                    # 设置环境变量，跳过后续重启
+                    echo "STOP_REQUESTED=true" >> $GITHUB_ENV
+
+                    # restart 模式：停止后仍会触发下一次运行
+                    if [ "$RESTART_VALUE" = "true" ]; then
+                      echo "RESTART_REQUESTED=true" >> $GITHUB_ENV
+                    fi
+
+                    # 后台异步重置停止信号（防止下次运行时立即停止）
+                    (
+                      pip install huggingface_hub -q 2>/dev/null
+                      python3 -c "from huggingface_hub import HfApi; import os, json; api=HfApi(); api.upload_file(path_or_fileobj=json.dumps({'stop':False,'restart':False,'timestamp':'','reset_by':'loop'}).encode(),path_in_repo='stop.json',repo_id=os.environ.get('HF_DATASET'),repo_type='dataset',token=os.environ.get('HF_TOKEN')); print('✅ 停止信号已重置')" 2>/dev/null
+                    ) &
+
+                    break 2
+                  fi
+                fi
+              fi
+              sleep 1
+            done
+          done
+
+      # =============================================
+      # 打包多个目录
+      # =============================================
+      - name: 打包所有要备份的目录
+        run: |
+          # 优先使用输入参数，否则从文件读取默认列表
+          DIRS_INPUT="${{ inputs.backup_dirs }}"
+          if [ -n "$DIRS_INPUT" ]; then
+            DIRS="$DIRS_INPUT"
+          elif [ -n "${{ env.BACKUP_DIRS_FILE }}" ] && [ -f "${{ env.BACKUP_DIRS_FILE }}" ]; then
+            DIRS="$(paste -sd, "${{ env.BACKUP_DIRS_FILE }}")"
+          else
+            DIRS=""
+          fi
+
+          echo "备份目录: ${DIRS}"
+          echo ""
+
+          # 将逗号/换行分隔转换为空格分隔
+          DIR_LIST=$(printf '%s' "$DIRS" | tr ',\n' '  ')
+
+          # 过滤存在的目录/文件（/root 默认 700，需要 sudo 才能探测是否存在）
+          VALID_DIRS=""
+          for dir in $DIR_LIST; do
+            if sudo test -d "$dir" 2>/dev/null || sudo test -f "$dir" 2>/dev/null; then
+              VALID_DIRS="$VALID_DIRS $dir"
+              echo "✓ $dir"
+            else
+              echo "✗ $dir (不存在，跳过)"
+            fi
+          done
+
+          if [ -z "$VALID_DIRS" ]; then
+            echo "错误：没有有效的备份目录"
+            exit 1
+          fi
+
+          # 后台并行计算各目录大小（不阻塞打包）
+          SIZE_TMPDIR=$(mktemp -d)
+          (
+            for dir in $VALID_DIRS; do
+              if sudo test -d "$dir" 2>/dev/null; then
+                DIR_SIZE=$(sudo du -sm "$dir" 2>/dev/null | cut -f1)
+                echo "$dir:${DIR_SIZE}" >> "$SIZE_TMPDIR/sizes.txt"
+              elif sudo test -f "$dir" 2>/dev/null; then
+                FILE_SIZE=$(sudo du -m "$dir" 2>/dev/null | cut -f1)
+                echo "$dir:${FILE_SIZE}" >> "$SIZE_TMPDIR/sizes.txt"
+              fi
+            done
+            echo "done" > "$SIZE_TMPDIR/complete"
+          ) &
+
+          echo "开始打包并加密（目录大小正在后台计算）..."
+          # 安装 pigz 多线程压缩
+          sudo apt-get install -y pigz > /dev/null 2>&1
+
+          echo "============================================="
+          echo "📦 开始打包加密..."
+          echo "============================================="
+
+          # 停止 Docker 服务
+          echo "停止 Docker 服务..."
+          sudo systemctl stop docker 2>/dev/null || true
+          sudo systemctl stop docker.socket 2>/dev/null || true
+
+          PACK_START=$(date +%s)
+
+          # 使用 sudo 以读取所有文件，保留权限 (-p)，pigz 多线程压缩，然后加密
+          # 排除备份文件本身，避免循环打包
+          PASSWORD="${{ env.BACKUP_PASSWORD }}"
+          set -o pipefail
+          if sudo tar -cpf - --exclude='backup.tar.gz.enc' --exclude='*.tar.gz.enc' $VALID_DIRS | pigz -p $(nproc) | openssl enc -aes-256-cbc -salt -pbkdf2 -pass pass:"$PASSWORD" -out backup.tar.gz.enc 2>&1; then
+            PACK_END=$(date +%s)
+            PACK_TIME=$((PACK_END - PACK_START))
+            echo "✅ 打包加密完成 (耗时: ${PACK_TIME} 秒)"
+          else
+            PACK_END=$(date +%s)
+            PACK_TIME=$((PACK_END - PACK_START))
+            echo "❌ 打包加密失败 (耗时: ${PACK_TIME} 秒)"
+            exit 1
+          fi
+          set +o pipefail
+
+          ls -lh backup.tar.gz.enc
+
+          # 检查文件大小
+          SIZE_BYTES=$(stat -c%s backup.tar.gz.enc)
+          SIZE_MB=$((SIZE_BYTES / 1024 / 1024))
+
+          echo ""
+          echo "备份文件大小: ${SIZE_MB} MB"
+
+          if [ $SIZE_BYTES -gt 104857600 ]; then
+            echo ""
+            echo "⚠️  警告：备份文件较大 (${SIZE_MB} MB)，上传可能需要更长时间"
+          elif [ $SIZE_BYTES -gt 52428800 ]; then
+            echo ""
+            echo "⚠️  提示：备份文件超过 50MB"
+          else
+            echo "✅ 备份文件大小正常"
+          fi
+
+          # 输出目录大小（如果后台任务已完成）
+          if [ -f "$SIZE_TMPDIR/complete" ]; then
+            echo ""
+            echo "各目录大小："
+            echo "-------------------------------------------"
+            TOTAL_SIZE=0
+            while IFS=: read -r dir size; do
+              echo "  $dir: ${size} MB"
+              TOTAL_SIZE=$((TOTAL_SIZE + size))
+            done < "$SIZE_TMPDIR/sizes.txt"
+            echo "-------------------------------------------"
+            echo "  总计: ${TOTAL_SIZE} MB"
+            rm -rf "$SIZE_TMPDIR"
+          fi
+
+          # 保存打包时间供上传步骤使用
+          echo "PACK_TIME=${PACK_TIME}" >> $GITHUB_ENV
+
+      # =============================================
+      # 使用 huggingface_hub API 上传备份（支持大文件 > 5GB）
+      # =============================================
+      - name: 上传备份到 Hugging Face
+        run: |
+          TOKEN="${{ env.HF_TOKEN }}"
+          DATASET="${{ env.HF_DATASET }}"
+          PACK_TIME="${{ env.PACK_TIME }}"
+
+          # 安装 huggingface_hub
+          pip install huggingface_hub -q
+
+          echo "============================================="
+          echo "📤 开始上传备份..."
+          echo "============================================="
+          UPLOAD_START=$(date +%s)
+
+          # 使用 Python API 上传（支持大文件分块上传）
+          python3 << 'EOF'
+          from huggingface_hub import HfApi
+          import os
+          import json
+
+          token = os.environ.get('TOKEN')
+          dataset = os.environ.get('DATASET')
+
+          api = HfApi()
+
+          # 上传统份文件（支持 > 5GB）
+          print("上传备份文件...")
+          api.upload_file(
+              path_or_fileobj="backup.tar.gz.enc",
+              path_in_repo="backup.tar.gz.enc",
+              repo_id=dataset,
+              repo_type="dataset",
+              token=token,
+              commit_message=f"backup {os.popen('date +%Y-%m-%d\\ %H:%M:%S').read().strip()}"
+          )
+
+          # 上传停止信号
+          stop_data = json.dumps({"stop": False, "restart": False, "timestamp": ""})
+          api.upload_file(
+              path_or_fileobj=stop_data.encode(),
+              path_in_repo="stop.json",
+              repo_id=dataset,
+              repo_type="dataset",
+              token=token,
+              commit_message="reset stop signal"
+          )
+
+          print("✅ 上传完成")
+          EOF
+
+          UPLOAD_END=$(date +%s)
+          UPLOAD_TIME=$((UPLOAD_END - UPLOAD_START))
+
+          echo ""
+          echo "============================================="
+          echo "📊 备份统计"
+          echo "============================================="
+          echo "📦 打包耗时: ${PACK_TIME:-N/A} 秒"
+          echo "📤 上传耗时: ${UPLOAD_TIME} 秒"
+          echo "⏱️  总耗时: $(((${PACK_TIME:-0} + UPLOAD_TIME))) 秒"
+          echo ""
+          echo "✅ 备份已上传到: https://huggingface.co/datasets/$DATASET"
+        env:
+          TOKEN: ${{ env.HF_TOKEN }}
+          DATASET: ${{ env.HF_DATASET }}
+
+      # =============================================
+      # 自动触发下一次循环
+      # =============================================
+      - name: 重启任务
+        # 确保即使前面打包/上传失败也能触发下一次（尤其是 restart/自动续跑 模式）
+        if: always() && (env.RESTART_REQUESTED == 'true')
+        uses: peter-evans/repository-dispatch@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          event-type: run-next
+
+      - name: 等待下次运行
+        if: always() && (env.RESTART_REQUESTED == 'true')
+        run: |
+          WAIT_SECONDS=${{ env.WAIT_BEFORE_NEXT || '60' }}
+          echo "⏳ 等待 ${WAIT_SECONDS} 秒后开始下次运行..."
+          sleep $WAIT_SECONDS
+          echo "✅ 等待完成"
+
+      - name: 停止完成
+        if: always() && env.STOP_REQUESTED == 'true' && env.RESTART_REQUESTED != 'true'
+        run: |
+          echo "✅ 已按要求停止，不再重启"
+
+      - name: 重启完成
+        if: always() && (env.RESTART_REQUESTED == 'true')
+        run: |
+          echo "✅ 已按要求重启：完成备份并触发下一次运行"
