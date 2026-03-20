@@ -1,2 +1,3 @@
 /var/lib/tailscale
 /var/lib/docker
+/root/mydata
