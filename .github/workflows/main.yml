@@ -1,4 +1,4 @@
-name: Phoenix Runner
+name: Docker Runner
 
 env:
   # Default backup list lives in a file to keep this workflow readable.
